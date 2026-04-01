@@ -11,7 +11,7 @@
 
 // USB transfer parameters
 #define R26_NUM_ISO_PACKETS     8
-#define R26_NUM_TRANSFERS       4
+#define R26_NUM_TRANSFERS       16
 #define R26_MAX_PACKET_SIZE     1024
 
 // Audio endpoint info discovered during probe

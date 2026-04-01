@@ -34,6 +34,27 @@ int r26_open(R26Device *dev) {
 
     printf("r26d: Roland R-26 found!\n");
 
+    // Log device speed — critical for isochronous transfer setup
+    int speed = libusb_get_device_speed(libusb_get_device(dev->handle));
+    const char *speed_str = "Unknown";
+    switch (speed) {
+        case LIBUSB_SPEED_LOW:       speed_str = "Low (1.5 Mbps)"; break;
+        case LIBUSB_SPEED_FULL:      speed_str = "Full (12 Mbps)"; break;
+        case LIBUSB_SPEED_HIGH:      speed_str = "High (480 Mbps)"; break;
+        case LIBUSB_SPEED_SUPER:     speed_str = "Super (5 Gbps)"; break;
+        case LIBUSB_SPEED_SUPER_PLUS: speed_str = "Super+ (10 Gbps)"; break;
+    }
+    printf("r26d: Device speed: %s\n", speed_str);
+
+    // Try to set configuration 1 explicitly
+    rc = libusb_set_configuration(dev->handle, 1);
+    if (rc < 0) {
+        printf("r26d: set_configuration(1): %s (may be OK if already set)\n",
+               libusb_error_name(rc));
+    } else {
+        printf("r26d: Configuration 1 set\n");
+    }
+
     // Detach kernel driver if attached (e.g. old kext or Apple's default)
     for (int i = 0; i < 4; i++) {
         if (libusb_kernel_driver_active(dev->handle, i) == 1) {
@@ -223,6 +244,7 @@ int r26_probe(R26Device *dev) {
         }
     }
 
+    int num_interfaces = config->bNumInterfaces;
     libusb_free_config_descriptor(config);
 
     if (!found_in) {
@@ -232,27 +254,76 @@ int r26_probe(R26Device *dev) {
         return -1;
     }
 
-    // Claim the interface and set alternate setting
-    rc = libusb_claim_interface(dev->handle, dev->audio_ep.iface_num);
-    if (rc < 0) {
-        fprintf(stderr, "r26d: Cannot claim interface %d: %s\n",
-                dev->audio_ep.iface_num, libusb_error_name(rc));
-        fprintf(stderr, "r26d: Try running with sudo, or check USB permissions.\n");
-        return -1;
+    // Claim all interfaces — Roland devices need both IN and OUT active
+    for (int i = 0; i < num_interfaces; i++) {
+        rc = libusb_claim_interface(dev->handle, i);
+        if (rc < 0) {
+            fprintf(stderr, "r26d: Cannot claim interface %d: %s\n",
+                    i, libusb_error_name(rc));
+            if (i == dev->audio_ep.iface_num) {
+                fprintf(stderr, "r26d: Try running with sudo, or check USB permissions.\n");
+                return -1;
+            }
+        } else {
+            printf("r26d: Claimed interface %d\n", i);
+        }
     }
     dev->iface_claimed = true;
 
-    if (dev->audio_ep.alt_setting > 0) {
-        rc = libusb_set_interface_alt_setting(dev->handle,
-                                               dev->audio_ep.iface_num,
-                                               dev->audio_ep.alt_setting);
+    // Set alt setting 1 on the OUT interface (interface 1) to activate it
+    if (found_out) {
+        // The OUT endpoint was on interface 1 alt 1 (from descriptor dump)
+        rc = libusb_set_interface_alt_setting(dev->handle, 1, 1);
         if (rc < 0) {
-            fprintf(stderr, "r26d: Cannot set alt setting %d: %s\n",
-                    dev->audio_ep.alt_setting, libusb_error_name(rc));
-            return -1;
+            fprintf(stderr, "r26d: Warning: Cannot set OUT interface alt setting: %s\n",
+                    libusb_error_name(rc));
+        } else {
+            printf("r26d: Set interface 1 alt setting 1 (OUT)\n");
         }
-        printf("r26d: Set interface %d alt setting %d\n",
-               dev->audio_ep.iface_num, dev->audio_ep.alt_setting);
+    }
+
+    // Set alt setting on the IN interface to allocate isochronous bandwidth
+    rc = libusb_set_interface_alt_setting(dev->handle,
+                                           dev->audio_ep.iface_num,
+                                           dev->audio_ep.alt_setting);
+    if (rc < 0) {
+        fprintf(stderr, "r26d: Cannot set alt setting %d: %s\n",
+                dev->audio_ep.alt_setting, libusb_error_name(rc));
+        return -1;
+    }
+    printf("r26d: Set interface %d alt setting %d (IN)\n",
+           dev->audio_ep.iface_num, dev->audio_ep.alt_setting);
+
+    // Send Roland vendor-specific activation command
+    // Roland devices typically need a vendor request to start the audio engine
+    rc = libusb_control_transfer(dev->handle,
+        LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_INTERFACE | LIBUSB_ENDPOINT_OUT,
+        0x01,   // vendor request - start audio
+        0x0000,
+        0x0000, // interface 0 (control)
+        NULL, 0,
+        1000);
+    if (rc < 0) {
+        printf("r26d: Vendor activate (0x01) returned: %s (may be OK)\n",
+               libusb_error_name(rc));
+    } else {
+        printf("r26d: Vendor activate sent\n");
+    }
+
+    // Try alternate activation: SET_CUR on sampling frequency to wake the device
+    uint8_t freq_data[3] = { 0x80, 0xBB, 0x00 }; // 48000 Hz LE
+    rc = libusb_control_transfer(dev->handle,
+        LIBUSB_REQUEST_TYPE_CLASS | LIBUSB_RECIPIENT_ENDPOINT | LIBUSB_ENDPOINT_OUT,
+        0x01,   // SET_CUR
+        0x0100, // Sampling Frequency Control
+        dev->audio_ep.ep_in,
+        freq_data, 3,
+        1000);
+    if (rc < 0) {
+        printf("r26d: SET_CUR sample rate returned: %s (may be OK)\n",
+               libusb_error_name(rc));
+    } else {
+        printf("r26d: Sample rate SET_CUR sent to EP 0x%02x\n", dev->audio_ep.ep_in);
     }
 
     // Deduce audio format from max packet size.
@@ -344,12 +415,13 @@ int r26_set_sample_rate(R26Device *dev, uint32_t rate) {
 }
 
 // Convert raw USB audio bytes to float samples and write to ring buffer
+// R-26 sends 24-bit audio in 4-byte (32-bit) containers, little-endian
 static void process_audio_data(R26Device *dev, const uint8_t *data, int length) {
     if (!g_shm || length <= 0) return;
 
     uint32_t ch = dev->channels;
-    uint32_t bps = dev->bit_depth;
-    uint32_t bytes_per_sample = bps / 8;
+    // R-26 uses 4-byte subframes (bSubframeSize=4) with 24-bit resolution
+    uint32_t bytes_per_sample = 4;
     uint32_t bytes_per_frame = ch * bytes_per_sample;
 
     if (bytes_per_frame == 0) return;
@@ -357,42 +429,34 @@ static void process_audio_data(R26Device *dev, const uint8_t *data, int length) 
     uint32_t nframes = length / bytes_per_frame;
     if (nframes == 0) return;
 
-    // Convert to float buffer
-    float fbuf[512 * R26_MAX_CHANNELS]; // enough for any reasonable packet
+    float fbuf[512 * R26_MAX_CHANNELS];
     if (nframes > 512) nframes = 512;
 
     for (uint32_t f = 0; f < nframes; f++) {
         for (uint32_t c = 0; c < ch; c++) {
             const uint8_t *p = data + (f * bytes_per_frame) + (c * bytes_per_sample);
-            float sample = 0.0f;
-
-            if (bps == 24) {
-                // 24-bit signed, little-endian
-                int32_t raw = (int32_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16));
-                if (raw & 0x800000) raw |= 0xFF000000; // sign extend
-                sample = (float)raw / 8388608.0f; // 2^23
-            } else if (bps == 16) {
-                // 16-bit signed, little-endian
-                int16_t raw = (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
-                sample = (float)raw / 32768.0f; // 2^15
-            } else if (bps == 32) {
-                // 32-bit signed, little-endian
-                int32_t raw = (int32_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-                                        ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24));
-                sample = (float)raw / 2147483648.0f; // 2^31
-            }
-
-            fbuf[f * ch + c] = sample;
+            // 24-bit audio in 32-bit LE container: data is in bytes [0..2], byte [3] is padding
+            int32_t raw = (int32_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16));
+            if (raw & 0x800000) raw |= 0xFF000000; // sign extend
+            fbuf[f * ch + c] = (float)raw / 8388608.0f; // 2^23
         }
     }
 
     r26_ring_write(g_shm, fbuf, nframes);
 }
 
-// Isochronous transfer callback
+// Track active transfers so we can detect when all have failed
+static volatile int g_active_transfers = 0;
+
+// Scratch buffer for copying packet data before resubmitting
+static uint8_t g_pkt_copy[1024];
+
+// Isochronous transfer callback — must be fast to avoid frame scheduling slip
 static void iso_callback(struct libusb_transfer *transfer) {
     if (!g_running) {
+        free(transfer->buffer);
         libusb_free_transfer(transfer);
+        __atomic_sub_fetch(&g_active_transfers, 1, __ATOMIC_SEQ_CST);
         return;
     }
 
@@ -401,39 +465,129 @@ static void iso_callback(struct libusb_transfer *transfer) {
 
         R26Device *dev = (R26Device *)transfer->user_data;
 
-        for (int i = 0; i < transfer->num_iso_packets; i++) {
+        // Collect packet info BEFORE resubmitting (time-critical)
+        int pkt_count = transfer->num_iso_packets;
+        uint32_t pkt_lengths[R26_NUM_ISO_PACKETS];
+        uint32_t pkt_offsets[R26_NUM_ISO_PACKETS];
+        uint32_t total_copy = 0;
+
+        for (int i = 0; i < pkt_count; i++) {
             struct libusb_iso_packet_descriptor *pkt = &transfer->iso_packet_desc[i];
+            pkt_lengths[i] = 0;
+            pkt_offsets[i] = total_copy;
             if (pkt->status == LIBUSB_TRANSFER_COMPLETED && pkt->actual_length > 0) {
-                uint8_t *pkt_data = libusb_get_iso_packet_buffer_simple(transfer, i);
-                process_audio_data(dev, pkt_data, pkt->actual_length);
+                uint32_t len = pkt->actual_length;
+                if (total_copy + len <= sizeof(g_pkt_copy)) {
+                    uint8_t *src = libusb_get_iso_packet_buffer_simple(transfer, i);
+                    memcpy(g_pkt_copy + total_copy, src, len);
+                    pkt_lengths[i] = len;
+                    total_copy += len;
+                }
             }
         }
 
-        // Resubmit transfer
+        // Resubmit IMMEDIATELY — before processing audio data
+        libusb_set_iso_packet_lengths(transfer, transfer->iso_packet_desc[0].length);
         int rc = libusb_submit_transfer(transfer);
         if (rc < 0) {
-            fprintf(stderr, "r26d: Resubmit failed: %s\n", libusb_error_name(rc));
+            free(transfer->buffer);
             libusb_free_transfer(transfer);
+            if (__atomic_sub_fetch(&g_active_transfers, 1, __ATOMIC_SEQ_CST) <= 0) {
+                fprintf(stderr, "r26d: All IN transfers failed, stopping.\n");
+                g_running = false;
+            }
+            return;
         }
+
+        // Now process the copied audio data (no longer time-critical)
+        for (int i = 0; i < pkt_count; i++) {
+            if (pkt_lengths[i] > 0) {
+                process_audio_data(dev, g_pkt_copy + pkt_offsets[i], pkt_lengths[i]);
+            }
+        }
+
     } else if (transfer->status == LIBUSB_TRANSFER_CANCELLED) {
+        free(transfer->buffer);
         libusb_free_transfer(transfer);
+        __atomic_sub_fetch(&g_active_transfers, 1, __ATOMIC_SEQ_CST);
     } else {
-        fprintf(stderr, "r26d: ISO transfer error: %d\n", transfer->status);
-        // Try to resubmit
+        // Try to resubmit on error
         int rc = libusb_submit_transfer(transfer);
         if (rc < 0) {
+            free(transfer->buffer);
             libusb_free_transfer(transfer);
+            if (__atomic_sub_fetch(&g_active_transfers, 1, __ATOMIC_SEQ_CST) <= 0) {
+                fprintf(stderr, "r26d: All IN transfers failed, stopping.\n");
+                g_running = false;
+            }
         }
+    }
+}
+
+// Callback for OUT (playback) transfers — resubmit silence immediately
+static void iso_out_callback(struct libusb_transfer *transfer) {
+    if (!g_running) {
+        free(transfer->buffer);
+        libusb_free_transfer(transfer);
+        return;
+    }
+
+    // Resubmit immediately regardless of status (silence — no data to preserve)
+    libusb_set_iso_packet_lengths(transfer, transfer->iso_packet_desc[0].length);
+    int rc = libusb_submit_transfer(transfer);
+    if (rc < 0) {
+        free(transfer->buffer);
+        libusb_free_transfer(transfer);
     }
 }
 
 int r26_start_capture(R26Device *dev) {
     printf("r26d: Starting isochronous capture from EP 0x%02x\n", dev->audio_ep.ep_in);
 
-    uint16_t mps = dev->audio_ep.max_packet_in;
-    if (mps == 0) mps = R26_MAX_PACKET_SIZE;
+    uint16_t mps_in = dev->audio_ep.max_packet_in;
+    if (mps_in == 0) mps_in = R26_MAX_PACKET_SIZE;
 
-    // Submit multiple transfers for continuous capture
+    uint16_t mps_out = dev->audio_ep.max_packet_out;
+    if (mps_out == 0) mps_out = 64;
+
+    // Submit OUT (playback) transfers with silence to kick-start the device
+    if (dev->audio_ep.ep_out) {
+        printf("r26d: Starting silence output on EP 0x%02x to activate device\n",
+               dev->audio_ep.ep_out);
+        for (int i = 0; i < R26_NUM_TRANSFERS; i++) {
+            struct libusb_transfer *transfer = libusb_alloc_transfer(R26_NUM_ISO_PACKETS);
+            if (!transfer) continue;
+
+            uint8_t *buf = calloc(R26_NUM_ISO_PACKETS, mps_out);
+            if (!buf) {
+                libusb_free_transfer(transfer);
+                continue;
+            }
+
+            libusb_fill_iso_transfer(transfer, dev->handle,
+                                      dev->audio_ep.ep_out,
+                                      buf,
+                                      R26_NUM_ISO_PACKETS * mps_out,
+                                      R26_NUM_ISO_PACKETS,
+                                      iso_out_callback,
+                                      dev,
+                                      1000);
+
+            libusb_set_iso_packet_lengths(transfer, mps_out);
+
+            int rc = libusb_submit_transfer(transfer);
+            if (rc < 0) {
+                fprintf(stderr, "r26d: Cannot submit OUT transfer %d: %s\n",
+                        i, libusb_error_name(rc));
+                free(buf);
+                libusb_free_transfer(transfer);
+            } else {
+                printf("r26d: OUT transfer %d submitted\n", i);
+            }
+        }
+    }
+
+    // Submit IN (capture) transfers
     for (int i = 0; i < R26_NUM_TRANSFERS; i++) {
         struct libusb_transfer *transfer = libusb_alloc_transfer(R26_NUM_ISO_PACKETS);
         if (!transfer) {
@@ -441,7 +595,7 @@ int r26_start_capture(R26Device *dev) {
             return -1;
         }
 
-        uint8_t *buf = calloc(R26_NUM_ISO_PACKETS, mps);
+        uint8_t *buf = calloc(R26_NUM_ISO_PACKETS, mps_in);
         if (!buf) {
             libusb_free_transfer(transfer);
             fprintf(stderr, "r26d: Cannot allocate transfer buffer\n");
@@ -451,25 +605,26 @@ int r26_start_capture(R26Device *dev) {
         libusb_fill_iso_transfer(transfer, dev->handle,
                                   dev->audio_ep.ep_in,
                                   buf,
-                                  R26_NUM_ISO_PACKETS * mps,
+                                  R26_NUM_ISO_PACKETS * mps_in,
                                   R26_NUM_ISO_PACKETS,
                                   iso_callback,
                                   dev,
                                   1000);
 
-        libusb_set_iso_packet_lengths(transfer, mps);
+        libusb_set_iso_packet_lengths(transfer, mps_in);
 
         int rc = libusb_submit_transfer(transfer);
         if (rc < 0) {
-            fprintf(stderr, "r26d: Cannot submit transfer %d: %s\n", i, libusb_error_name(rc));
+            fprintf(stderr, "r26d: Cannot submit IN transfer %d: %s\n", i, libusb_error_name(rc));
             free(buf);
             libusb_free_transfer(transfer);
             return -1;
         }
+        __atomic_add_fetch(&g_active_transfers, 1, __ATOMIC_SEQ_CST);
     }
 
-    printf("r26d: Capture started (%d transfers, %d packets each)\n",
-           R26_NUM_TRANSFERS, R26_NUM_ISO_PACKETS);
+    printf("r26d: Capture started (%d IN + %d OUT transfers, %d packets each)\n",
+           R26_NUM_TRANSFERS, R26_NUM_TRANSFERS, R26_NUM_ISO_PACKETS);
 
     // Update shared memory header
     if (g_shm) {
