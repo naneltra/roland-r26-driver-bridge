@@ -415,12 +415,10 @@ int r26_set_sample_rate(R26Device *dev, uint32_t rate) {
 }
 
 // Convert raw USB audio bytes to float samples and write to ring buffer
-// R-26 sends 24-bit audio in 4-byte (32-bit) containers, little-endian
 static void process_audio_data(R26Device *dev, const uint8_t *data, int length) {
     if (!g_shm || length <= 0) return;
 
     uint32_t ch = dev->channels;
-    // R-26 uses 4-byte subframes (bSubframeSize=4) with 24-bit resolution
     uint32_t bytes_per_sample = 4;
     uint32_t bytes_per_frame = ch * bytes_per_sample;
 
@@ -435,10 +433,10 @@ static void process_audio_data(R26Device *dev, const uint8_t *data, int length) 
     for (uint32_t f = 0; f < nframes; f++) {
         for (uint32_t c = 0; c < ch; c++) {
             const uint8_t *p = data + (f * bytes_per_frame) + (c * bytes_per_sample);
-            // 24-bit audio in 32-bit LE container: data is in bytes [0..2], byte [3] is padding
-            int32_t raw = (int32_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16));
-            if (raw & 0x800000) raw |= 0xFF000000; // sign extend
-            fbuf[f * ch + c] = (float)raw / 8388608.0f; // 2^23
+            // Read full 32-bit LE value — 24-bit audio is left-justified (upper 24 bits)
+            int32_t raw = (int32_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                                    ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24));
+            fbuf[f * ch + c] = (float)raw / 2147483648.0f; // 2^31
         }
     }
 
@@ -545,17 +543,18 @@ static void fill_out_buffer(R26Device *dev, uint8_t *buf, int num_packets, uint1
 
         uint64_t got = r26_rb_read(&g_shm->output, ch, fbuf, frames_per_pkt);
 
-        // Convert float → 24-bit LE in 4-byte containers
+        // Convert float → 32-bit LE (24-bit left-justified in 32-bit container)
         for (uint32_t f = 0; f < got; f++) {
             for (uint32_t c = 0; c < ch; c++) {
-                int32_t raw = (int32_t)(fbuf[f * ch + c] * 8388607.0f);
-                if (raw > 8388607) raw = 8388607;
-                if (raw < -8388608) raw = -8388608;
+                float sample = fbuf[f * ch + c];
+                if (sample > 1.0f) sample = 1.0f;
+                if (sample < -1.0f) sample = -1.0f;
+                int32_t raw = (int32_t)(sample * 2147483647.0f);
                 uint8_t *dst = pkt_buf + (f * bytes_per_frame) + (c * bytes_per_sample);
                 dst[0] = (uint8_t)(raw & 0xFF);
                 dst[1] = (uint8_t)((raw >> 8) & 0xFF);
                 dst[2] = (uint8_t)((raw >> 16) & 0xFF);
-                dst[3] = 0; // padding byte
+                dst[3] = (uint8_t)((raw >> 24) & 0xFF);
             }
         }
         // Zero-fill remaining frames
@@ -594,8 +593,16 @@ int r26_start_capture(R26Device *dev) {
     uint16_t mps_in = dev->audio_ep.max_packet_in;
     if (mps_in == 0) mps_in = R26_MAX_PACKET_SIZE;
 
-    uint16_t mps_out = dev->audio_ep.max_packet_out;
-    if (mps_out == 0) mps_out = 64;
+    // Calculate actual bytes per microframe for OUT endpoint
+    // At 48kHz high-speed: 48000/8000 = 6 frames per microframe
+    // 6 frames × 2ch × 4 bytes = 48 bytes
+    uint32_t bytes_per_frame = dev->channels * 4; // 4-byte subframes
+    uint32_t frames_per_uframe = dev->sample_rate / 8000;
+    uint16_t mps_out = frames_per_uframe * bytes_per_frame;
+    if (mps_out == 0 || mps_out > dev->audio_ep.max_packet_out)
+        mps_out = dev->audio_ep.max_packet_out;
+    printf("r26d: OUT packet size: %d bytes (%d frames per microframe)\n",
+           mps_out, frames_per_uframe);
 
     // Submit OUT (playback) transfers with silence to kick-start the device
     if (dev->audio_ep.ep_out) {
