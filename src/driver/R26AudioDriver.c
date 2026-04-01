@@ -29,6 +29,7 @@
 #define kDeviceObjectID         ((AudioObjectID)2)
 #define kInputStreamObjectID    ((AudioObjectID)3)
 #define kVolumeControlObjectID  ((AudioObjectID)4)
+#define kOutputStreamObjectID   ((AudioObjectID)5)
 
 #define kDeviceName             "Roland R-26"
 #define kDeviceManufacturer     "Roland"
@@ -304,6 +305,7 @@ static Boolean R26_HasProperty(AudioServerPlugInDriverRef inDriver,
             break;
 
         case kInputStreamObjectID:
+        case kOutputStreamObjectID:
             switch (inAddress->mSelector) {
                 case kAudioObjectPropertyBaseClass:
                 case kAudioObjectPropertyClass:
@@ -419,16 +421,17 @@ static OSStatus R26_GetPropertyDataSize(AudioServerPlugInDriverRef inDriver,
                 case kAudioDevicePropertySafetyOffset:
                     *outDataSize = sizeof(UInt32); return kAudioHardwareNoError;
                 case kAudioDevicePropertyStreams:
-                    if (inAddress->mScope == kAudioObjectPropertyScopeInput ||
-                        inAddress->mScope == kAudioObjectPropertyScopeGlobal)
+                    if (inAddress->mScope == kAudioObjectPropertyScopeInput)
                         *outDataSize = sizeof(AudioObjectID);
-                    else
-                        *outDataSize = 0;
+                    else if (inAddress->mScope == kAudioObjectPropertyScopeOutput)
+                        *outDataSize = sizeof(AudioObjectID);
+                    else // global
+                        *outDataSize = 2 * sizeof(AudioObjectID);
                     return kAudioHardwareNoError;
                 case kAudioObjectPropertyControlList:
                     *outDataSize = sizeof(AudioObjectID); return kAudioHardwareNoError;
                 case kAudioObjectPropertyOwnedObjects:
-                    *outDataSize = 2 * sizeof(AudioObjectID); return kAudioHardwareNoError;
+                    *outDataSize = 3 * sizeof(AudioObjectID); return kAudioHardwareNoError;
                 case kAudioDevicePropertyNominalSampleRate:
                     *outDataSize = sizeof(Float64); return kAudioHardwareNoError;
                 case kAudioDevicePropertyAvailableNominalSampleRates:
@@ -447,6 +450,7 @@ static OSStatus R26_GetPropertyDataSize(AudioServerPlugInDriverRef inDriver,
             break;
 
         case kInputStreamObjectID:
+        case kOutputStreamObjectID:
             switch (inAddress->mSelector) {
                 case kAudioObjectPropertyBaseClass:
                 case kAudioObjectPropertyClass:
@@ -623,7 +627,8 @@ static OSStatus R26_GetPropertyData(AudioServerPlugInDriverRef inDriver,
 
                 case kAudioDevicePropertyDeviceCanBeDefaultDevice:
                     *outDataSize = sizeof(UInt32);
-                    *((UInt32 *)outData) = (inAddress->mScope == kAudioObjectPropertyScopeInput) ? 1 : 0;
+                    *((UInt32 *)outData) = (inAddress->mScope == kAudioObjectPropertyScopeInput ||
+                                            inAddress->mScope == kAudioObjectPropertyScopeOutput) ? 1 : 0;
                     return kAudioHardwareNoError;
 
                 case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice:
@@ -642,24 +647,32 @@ static OSStatus R26_GetPropertyData(AudioServerPlugInDriverRef inDriver,
                     return kAudioHardwareNoError;
 
                 case kAudioDevicePropertyStreams:
-                    if (inAddress->mScope == kAudioObjectPropertyScopeInput ||
-                        inAddress->mScope == kAudioObjectPropertyScopeGlobal) {
+                    if (inAddress->mScope == kAudioObjectPropertyScopeInput) {
                         *outDataSize = sizeof(AudioObjectID);
                         *((AudioObjectID *)outData) = kInputStreamObjectID;
+                    } else if (inAddress->mScope == kAudioObjectPropertyScopeOutput) {
+                        *outDataSize = sizeof(AudioObjectID);
+                        *((AudioObjectID *)outData) = kOutputStreamObjectID;
                     } else {
-                        *outDataSize = 0;
+                        // Global scope — return both
+                        AudioObjectID *ids = (AudioObjectID *)outData;
+                        ids[0] = kInputStreamObjectID;
+                        if (inDataSize >= 2 * sizeof(AudioObjectID))
+                            ids[1] = kOutputStreamObjectID;
+                        *outDataSize = (inDataSize >= 2 * sizeof(AudioObjectID))
+                            ? 2 * sizeof(AudioObjectID) : sizeof(AudioObjectID);
                     }
                     return kAudioHardwareNoError;
 
                 case kAudioObjectPropertyOwnedObjects: {
                     UInt32 count = 0;
                     AudioObjectID *ids = (AudioObjectID *)outData;
-                    if (inDataSize >= sizeof(AudioObjectID)) {
+                    if (inDataSize >= (count + 1) * sizeof(AudioObjectID))
                         ids[count++] = kInputStreamObjectID;
-                    }
-                    if (inDataSize >= 2 * sizeof(AudioObjectID)) {
+                    if (inDataSize >= (count + 1) * sizeof(AudioObjectID))
+                        ids[count++] = kOutputStreamObjectID;
+                    if (inDataSize >= (count + 1) * sizeof(AudioObjectID))
                         ids[count++] = kVolumeControlObjectID;
-                    }
                     *outDataSize = count * sizeof(AudioObjectID);
                     return kAudioHardwareNoError;
                 }
@@ -726,8 +739,9 @@ static OSStatus R26_GetPropertyData(AudioServerPlugInDriverRef inDriver,
             }
             break;
 
-        // ---- Input Stream Object ----
+        // ---- Stream Objects (Input + Output) ----
         case kInputStreamObjectID:
+        case kOutputStreamObjectID:
             switch (inAddress->mSelector) {
                 case kAudioObjectPropertyBaseClass:
                     *outDataSize = sizeof(AudioClassID);
@@ -746,7 +760,8 @@ static OSStatus R26_GetPropertyData(AudioServerPlugInDriverRef inDriver,
 
                 case kAudioObjectPropertyName:
                     *outDataSize = sizeof(CFStringRef);
-                    *((CFStringRef *)outData) = CFSTR("R-26 Input");
+                    *((CFStringRef *)outData) = (inObjectID == kInputStreamObjectID)
+                        ? CFSTR("R-26 Input") : CFSTR("R-26 Output");
                     return kAudioHardwareNoError;
 
                 case kAudioStreamPropertyIsActive:
@@ -756,12 +771,14 @@ static OSStatus R26_GetPropertyData(AudioServerPlugInDriverRef inDriver,
 
                 case kAudioStreamPropertyDirection:
                     *outDataSize = sizeof(UInt32);
-                    *((UInt32 *)outData) = 1; // 1 = input
+                    *((UInt32 *)outData) = (inObjectID == kInputStreamObjectID) ? 1 : 0;
                     return kAudioHardwareNoError;
 
                 case kAudioStreamPropertyTerminalType:
                     *outDataSize = sizeof(UInt32);
-                    *((UInt32 *)outData) = kAudioStreamTerminalTypeMicrophone;
+                    *((UInt32 *)outData) = (inObjectID == kInputStreamObjectID)
+                        ? kAudioStreamTerminalTypeMicrophone
+                        : kAudioStreamTerminalTypeSpeaker;
                     return kAudioHardwareNoError;
 
                 case kAudioStreamPropertyStartingChannel:
@@ -1028,6 +1045,7 @@ static OSStatus R26_WillDoIOOperation(AudioServerPlugInDriverRef inDriver,
 
     switch (inOperationID) {
         case kAudioServerPlugInIOOperationReadInput:
+        case kAudioServerPlugInIOOperationWriteMix:
             *outWillDo = true;
             *outWillDoInPlace = true;
             break;
@@ -1063,18 +1081,17 @@ static OSStatus R26_DoIOOperation(AudioServerPlugInDriverRef inDriver,
         Float32 *buffer = (Float32 *)ioMainBuffer;
         UInt32 totalSamples = inIOBufferFrameSize * kNumChannels;
 
-        // Try to read from shared memory
+        // Try to read from shared memory (input ring buffer)
         if (gDriverState.shmConnected && gDriverState.shm) {
             uint32_t status = atomic_load_explicit(&gDriverState.shm->status, memory_order_acquire);
             if (status == R26_STATUS_RUNNING) {
-                uint64_t read = r26_ring_read(gDriverState.shm, buffer, inIOBufferFrameSize);
-                // If we didn't get enough frames, zero-fill the rest
+                uint64_t read = r26_rb_read(&gDriverState.shm->input, kNumChannels,
+                                             buffer, inIOBufferFrameSize);
                 if (read < inIOBufferFrameSize) {
                     memset(buffer + (read * kNumChannels), 0,
                            (inIOBufferFrameSize - read) * kBytesPerFrame);
                 }
 
-                // Apply volume
                 Float32 vol = gDriverState.volumeL;
                 if (vol < 1.0f) {
                     for (UInt32 i = 0; i < totalSamples; i++) {
@@ -1084,12 +1101,22 @@ static OSStatus R26_DoIOOperation(AudioServerPlugInDriverRef inDriver,
                 return kAudioHardwareNoError;
             }
         } else {
-            // Try reconnecting periodically
             shm_connect();
         }
 
-        // No data available - output silence
         memset(buffer, 0, totalSamples * sizeof(Float32));
+    }
+
+    if (inOperationID == kAudioServerPlugInIOOperationWriteMix) {
+        Float32 *buffer = (Float32 *)ioMainBuffer;
+
+        // Write output audio to shared memory (output ring buffer)
+        if (gDriverState.shmConnected && gDriverState.shm) {
+            r26_rb_write(&gDriverState.shm->output, kNumChannels,
+                         buffer, inIOBufferFrameSize);
+        } else {
+            shm_connect();
+        }
     }
 
     return kAudioHardwareNoError;

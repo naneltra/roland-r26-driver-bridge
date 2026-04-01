@@ -524,7 +524,49 @@ static void iso_callback(struct libusb_transfer *transfer) {
     }
 }
 
-// Callback for OUT (playback) transfers — resubmit silence immediately
+// Convert float samples from output ring buffer to 24-bit-in-32-bit USB format
+static void fill_out_buffer(R26Device *dev, uint8_t *buf, int num_packets, uint16_t mps) {
+    if (!g_shm) {
+        memset(buf, 0, num_packets * mps);
+        return;
+    }
+
+    uint32_t ch = dev->channels;
+    uint32_t bytes_per_sample = 4; // 32-bit containers
+    uint32_t bytes_per_frame = ch * bytes_per_sample;
+    if (bytes_per_frame == 0) bytes_per_frame = 8;
+
+    for (int p = 0; p < num_packets; p++) {
+        uint8_t *pkt_buf = buf + p * mps;
+        uint32_t frames_per_pkt = mps / bytes_per_frame;
+
+        float fbuf[64 * R26_MAX_CHANNELS];
+        if (frames_per_pkt > 64) frames_per_pkt = 64;
+
+        uint64_t got = r26_rb_read(&g_shm->output, ch, fbuf, frames_per_pkt);
+
+        // Convert float → 24-bit LE in 4-byte containers
+        for (uint32_t f = 0; f < got; f++) {
+            for (uint32_t c = 0; c < ch; c++) {
+                int32_t raw = (int32_t)(fbuf[f * ch + c] * 8388607.0f);
+                if (raw > 8388607) raw = 8388607;
+                if (raw < -8388608) raw = -8388608;
+                uint8_t *dst = pkt_buf + (f * bytes_per_frame) + (c * bytes_per_sample);
+                dst[0] = (uint8_t)(raw & 0xFF);
+                dst[1] = (uint8_t)((raw >> 8) & 0xFF);
+                dst[2] = (uint8_t)((raw >> 16) & 0xFF);
+                dst[3] = 0; // padding byte
+            }
+        }
+        // Zero-fill remaining frames
+        if (got < frames_per_pkt) {
+            memset(pkt_buf + got * bytes_per_frame, 0,
+                   (frames_per_pkt - got) * bytes_per_frame);
+        }
+    }
+}
+
+// Callback for OUT (playback) transfers
 static void iso_out_callback(struct libusb_transfer *transfer) {
     if (!g_running) {
         free(transfer->buffer);
@@ -532,8 +574,13 @@ static void iso_out_callback(struct libusb_transfer *transfer) {
         return;
     }
 
-    // Resubmit immediately regardless of status (silence — no data to preserve)
-    libusb_set_iso_packet_lengths(transfer, transfer->iso_packet_desc[0].length);
+    R26Device *dev = (R26Device *)transfer->user_data;
+    uint16_t mps = transfer->iso_packet_desc[0].length;
+
+    // Fill buffer with audio from output ring buffer (or silence if empty)
+    fill_out_buffer(dev, transfer->buffer, transfer->num_iso_packets, mps);
+
+    libusb_set_iso_packet_lengths(transfer, mps);
     int rc = libusb_submit_transfer(transfer);
     if (rc < 0) {
         free(transfer->buffer);
