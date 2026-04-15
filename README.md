@@ -46,6 +46,31 @@ cd build && make -j$(sysctl -n hw.ncpu) && sudo cp r26d /usr/local/bin/r26d && s
   - If the audio format doesn't match the defaults (48kHz/24-bit/stereo), the probe output will reveal the actual
   parameters, and the daemon's format detection can be refined
 
+  Hot-plug / fallback behaviour
+
+  The CoreAudio plugin tracks the daemon's shared memory and only advertises the
+  "Roland R-26" device while the daemon is running and producing audio. A
+  background monitor thread polls the SHM every 300 ms and watches for a
+  heartbeat (advancing input ring-buffer write position).
+
+  - When the R-26 is disconnected, the isochronous USB transfers fail, the
+    daemon exits cleanly and unlinks the SHM. Within ~300 ms the driver sees
+    the SHM is gone, flips `kAudioDevicePropertyDeviceIsAlive` to 0 and
+    removes the device from `kAudioPlugInPropertyDeviceList`, firing the
+    required `PropertiesChanged` notifications. macOS then automatically
+    switches the default input/output back to the previously-selected device.
+  - When the R-26 is reconnected and the daemon is restarted (launchd with
+    `KeepAlive` relaunches it), the monitor detects the new SHM inode, remaps
+    it with a 100 ms grace before unmapping the stale one, and re-advertises
+    the device.
+  - If the daemon is killed ungracefully (SIGKILL, crash) so the SHM is not
+    unlinked, the heartbeat check still catches it after ~3 s of no new
+    frames and tears the device down the same way.
+
+  This means you do not need to restart CoreAudio or your DAW when the R-26
+  is unplugged — the default device falls back on its own, and the R-26
+  reappears automatically on reconnect.
+
   ```
 
             R-26(AUDIO):

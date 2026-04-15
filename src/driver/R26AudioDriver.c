@@ -14,10 +14,12 @@
 #include <os/log.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
 #include <math.h>
+#include <stdatomic.h>
 
 #include "../shared/RingBuffer.h"
 
@@ -78,10 +80,19 @@ typedef struct {
     Float32                             volumeR;
     bool                                muted;
 
-    // Shared memory
-    R26SharedAudio                      *shm;
-    int                                 shmFd;
-    bool                                shmConnected;
+    // Shared memory (atomic pointer — swapped by monitor thread, read lock-free
+    // by the realtime IO thread).
+    _Atomic(R26SharedAudio *)           shm_ptr;
+    _Atomic(int)                        shm_fd;
+    _Atomic(uint64_t)                   shm_inode;
+
+    // Device liveness tracking. The virtual device is "alive" only while the
+    // r26d daemon is running and producing audio (i.e. the R-26 is connected).
+    // When the daemon goes away we clear this flag and notify CoreAudio so
+    // macOS switches the default input/output back to the previous device.
+    _Atomic(bool)                       deviceAlive;
+    pthread_t                           monitorThread;
+    _Atomic(bool)                       monitorRunning;
 } R26DriverState;
 
 static R26DriverState gDriverState = {0};
@@ -91,41 +102,137 @@ static os_log_t gLog;
 #define LOG_ERR(fmt, ...) os_log_error(gLog, "R26Audio: " fmt, ##__VA_ARGS__)
 
 // ============================================================================
-#pragma mark - Shared Memory
+#pragma mark - Device Presence Monitor
 // ============================================================================
+//
+// A background thread watches the daemon's shared memory. The virtual device
+// is considered "alive" only while the daemon is running AND the input ring
+// buffer is advancing (heartbeat). When the R-26 is disconnected the daemon
+// exits and unlinks the SHM name; we detect that and flip DeviceIsAlive to 0
+// plus remove the device from the plugin's device list, firing the required
+// PropertiesChanged notifications. macOS then falls back to the previous
+// default input/output device automatically.
 
-static void shm_connect(void) {
-    if (gDriverState.shmConnected) return;
+#define kMonitorPeriodUsec      300000      // 300 ms poll
+#define kMonitorStaleCycles     10          // ~3 s with no heartbeat = dead
+#define kMonitorGraceUsec       100000      // 100 ms grace before munmap
 
-    int fd = shm_open(R26_SHM_NAME, O_RDWR, 0666);
-    if (fd < 0) {
-        // Not an error - daemon may not be running yet
-        return;
-    }
+// Notify CoreAudio that the device's alive/running state changed and that
+// the plugin's device list has changed. Called after we flip deviceAlive.
+static void notify_alive_changed(void) {
+    AudioServerPlugInHostRef host = gDriverState.host;
+    if (!host) return;
 
-    void *ptr = mmap(NULL, R26_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (ptr == MAP_FAILED) {
-        close(fd);
-        return;
-    }
+    AudioObjectPropertyAddress devProps[] = {
+        { kAudioDevicePropertyDeviceIsAlive,
+          kAudioObjectPropertyScopeGlobal,
+          kAudioObjectPropertyElementMain },
+        { kAudioDevicePropertyDeviceIsRunning,
+          kAudioObjectPropertyScopeGlobal,
+          kAudioObjectPropertyElementMain },
+    };
+    host->PropertiesChanged(host, kDeviceObjectID, 2, devProps);
 
-    gDriverState.shm = (R26SharedAudio *)ptr;
-    gDriverState.shmFd = fd;
-    gDriverState.shmConnected = true;
-    LOG("Connected to shared memory");
+    AudioObjectPropertyAddress pluginProps[] = {
+        { kAudioPlugInPropertyDeviceList,
+          kAudioObjectPropertyScopeGlobal,
+          kAudioObjectPropertyElementMain },
+        { kAudioObjectPropertyOwnedObjects,
+          kAudioObjectPropertyScopeGlobal,
+          kAudioObjectPropertyElementMain },
+    };
+    host->PropertiesChanged(host, kPlugInObjectID, 2, pluginProps);
 }
 
-static void shm_disconnect(void) {
-    if (!gDriverState.shmConnected) return;
-    if (gDriverState.shm) {
-        munmap(gDriverState.shm, R26_SHM_SIZE);
-        gDriverState.shm = NULL;
+// Replace the current SHM mapping. Old mapping is unmapped after a short grace
+// period so any in-flight realtime IO load of the old pointer has drained.
+static void swap_shm_mapping(R26SharedAudio *newPtr, int newFd, uint64_t newInode) {
+    R26SharedAudio *oldPtr = atomic_exchange(&gDriverState.shm_ptr, newPtr);
+    int oldFd = atomic_exchange(&gDriverState.shm_fd, newFd);
+    atomic_store(&gDriverState.shm_inode, newInode);
+
+    if (oldPtr || oldFd >= 0) {
+        usleep(kMonitorGraceUsec);
+        if (oldPtr) munmap(oldPtr, R26_SHM_SIZE);
+        if (oldFd >= 0) close(oldFd);
     }
-    if (gDriverState.shmFd >= 0) {
-        close(gDriverState.shmFd);
-        gDriverState.shmFd = -1;
+}
+
+static void *monitor_thread(void *arg) {
+    (void)arg;
+    uint64_t last_write_pos = 0;
+    int stale_cycles = 0;
+
+    while (atomic_load(&gDriverState.monitorRunning)) {
+        bool alive = false;
+
+        int fd = shm_open(R26_SHM_NAME, O_RDWR, 0666);
+        if (fd >= 0) {
+            struct stat st;
+            if (fstat(fd, &st) == 0) {
+                uint64_t currentInode = atomic_load(&gDriverState.shm_inode);
+                if ((uint64_t)st.st_ino != currentInode) {
+                    // Daemon started (or restarted with a fresh SHM object).
+                    // Map the new region and swap it in.
+                    void *np = mmap(NULL, R26_SHM_SIZE,
+                                    PROT_READ | PROT_WRITE,
+                                    MAP_SHARED, fd, 0);
+                    if (np != MAP_FAILED) {
+                        swap_shm_mapping((R26SharedAudio *)np, fd, (uint64_t)st.st_ino);
+                        LOG("SHM mapped (inode=%llu)", (unsigned long long)st.st_ino);
+                        last_write_pos = 0;
+                        stale_cycles = 0;
+                    } else {
+                        close(fd);
+                    }
+                } else {
+                    // Same inode — no remap needed.
+                    close(fd);
+                }
+            } else {
+                close(fd);
+            }
+
+            R26SharedAudio *sp = atomic_load(&gDriverState.shm_ptr);
+            if (sp) {
+                uint32_t status = atomic_load_explicit(&sp->status,
+                                                       memory_order_acquire);
+                uint64_t wp = atomic_load_explicit(&sp->input.write_pos,
+                                                   memory_order_acquire);
+                if (status == R26_STATUS_RUNNING) {
+                    if (wp != last_write_pos) {
+                        alive = true;
+                        stale_cycles = 0;
+                    } else if (stale_cycles < kMonitorStaleCycles) {
+                        // Daemon hasn't produced new frames yet — give it a
+                        // brief grace window before declaring it dead.
+                        alive = true;
+                        stale_cycles++;
+                    }
+                    last_write_pos = wp;
+                }
+            }
+        } else {
+            // SHM name is gone: daemon exited (or was never up).
+            // Unmap any stale mapping we still hold.
+            if (atomic_load(&gDriverState.shm_ptr) != NULL ||
+                atomic_load(&gDriverState.shm_fd) >= 0) {
+                swap_shm_mapping(NULL, -1, 0);
+                LOG("SHM gone, unmapped");
+            }
+            last_write_pos = 0;
+            stale_cycles = 0;
+        }
+
+        bool prev = atomic_exchange(&gDriverState.deviceAlive, alive);
+        if (prev != alive) {
+            LOG("Device alive: %d -> %d", (int)prev, (int)alive);
+            notify_alive_changed();
+        }
+
+        usleep(kMonitorPeriodUsec);
     }
-    gDriverState.shmConnected = false;
+    return NULL;
 }
 
 // ============================================================================
@@ -194,10 +301,16 @@ static OSStatus R26_Initialize(AudioServerPlugInDriverRef inDriver,
     gDriverState.volumeR = 1.0f;
     gDriverState.muted = false;
     gDriverState.clockSeed = 1;
-    gDriverState.shmFd = -1;
+    atomic_store(&gDriverState.shm_ptr, NULL);
+    atomic_store(&gDriverState.shm_fd, -1);
+    atomic_store(&gDriverState.shm_inode, 0);
+    atomic_store(&gDriverState.deviceAlive, false);
 
     compute_host_ticks_per_frame();
-    shm_connect();
+
+    // Start background thread that tracks daemon/device presence.
+    atomic_store(&gDriverState.monitorRunning, true);
+    pthread_create(&gDriverState.monitorThread, NULL, monitor_thread, NULL);
 
     LOG("Initialized (sample rate: %.0f)", gDriverState.sampleRate);
     return kAudioHardwareNoError;
@@ -388,7 +501,9 @@ static OSStatus R26_GetPropertyDataSize(AudioServerPlugInDriverRef inDriver,
                     *outDataSize = sizeof(CFStringRef); return kAudioHardwareNoError;
                 case kAudioObjectPropertyOwnedObjects:
                 case kAudioPlugInPropertyDeviceList:
-                    *outDataSize = sizeof(AudioObjectID); return kAudioHardwareNoError;
+                    *outDataSize = atomic_load(&gDriverState.deviceAlive)
+                                   ? sizeof(AudioObjectID) : 0;
+                    return kAudioHardwareNoError;
                 case kAudioPlugInPropertyTranslateUIDToDevice:
                     *outDataSize = sizeof(AudioObjectID); return kAudioHardwareNoError;
             }
@@ -540,14 +655,20 @@ static OSStatus R26_GetPropertyData(AudioServerPlugInDriverRef inDriver,
 
                 case kAudioObjectPropertyOwnedObjects:
                 case kAudioPlugInPropertyDeviceList:
-                    *outDataSize = sizeof(AudioObjectID);
-                    *((AudioObjectID *)outData) = kDeviceObjectID;
+                    if (atomic_load(&gDriverState.deviceAlive) &&
+                        inDataSize >= sizeof(AudioObjectID)) {
+                        *outDataSize = sizeof(AudioObjectID);
+                        *((AudioObjectID *)outData) = kDeviceObjectID;
+                    } else {
+                        *outDataSize = 0;
+                    }
                     return kAudioHardwareNoError;
 
                 case kAudioPlugInPropertyTranslateUIDToDevice: {
                     CFStringRef uid = *((CFStringRef *)inQualifierData);
                     *outDataSize = sizeof(AudioObjectID);
-                    if (CFStringCompare(uid, CFSTR(kDeviceUID), 0) == kCFCompareEqualTo) {
+                    if (atomic_load(&gDriverState.deviceAlive) &&
+                        CFStringCompare(uid, CFSTR(kDeviceUID), 0) == kCFCompareEqualTo) {
                         *((AudioObjectID *)outData) = kDeviceObjectID;
                     } else {
                         *((AudioObjectID *)outData) = kAudioObjectUnknown;
@@ -617,7 +738,7 @@ static OSStatus R26_GetPropertyData(AudioServerPlugInDriverRef inDriver,
 
                 case kAudioDevicePropertyDeviceIsAlive:
                     *outDataSize = sizeof(UInt32);
-                    *((UInt32 *)outData) = 1;
+                    *((UInt32 *)outData) = atomic_load(&gDriverState.deviceAlive) ? 1 : 0;
                     return kAudioHardwareNoError;
 
                 case kAudioDevicePropertyDeviceIsRunning:
@@ -978,9 +1099,6 @@ static OSStatus R26_StartIO(AudioServerPlugInDriverRef inDriver,
         gDriverState.anchorSampleTime = 0.0;
         gDriverState.ioRunning = true;
 
-        // Try to connect to shared memory
-        shm_connect();
-
         LOG("IO started");
     }
     gDriverState.ioClientCount++;
@@ -1081,15 +1199,18 @@ static OSStatus R26_DoIOOperation(AudioServerPlugInDriverRef inDriver,
         Float32 *buffer = (Float32 *)ioMainBuffer;
         UInt32 totalSamples = inIOBufferFrameSize * kNumChannels;
 
-        // Try to read from shared memory (input ring buffer)
-        if (gDriverState.shmConnected && gDriverState.shm) {
-            uint32_t status = atomic_load_explicit(&gDriverState.shm->status, memory_order_acquire);
+        // Read from shared memory (input ring buffer). The shm_ptr is managed
+        // atomically by the monitor thread — lock-free read here.
+        R26SharedAudio *sp = atomic_load_explicit(&gDriverState.shm_ptr,
+                                                   memory_order_acquire);
+        if (sp) {
+            uint32_t status = atomic_load_explicit(&sp->status, memory_order_acquire);
             if (status == R26_STATUS_RUNNING) {
-                uint64_t read = r26_rb_read(&gDriverState.shm->input, kNumChannels,
-                                             buffer, inIOBufferFrameSize);
-                if (read < inIOBufferFrameSize) {
-                    memset(buffer + (read * kNumChannels), 0,
-                           (inIOBufferFrameSize - read) * kBytesPerFrame);
+                uint64_t rd = r26_rb_read(&sp->input, kNumChannels,
+                                           buffer, inIOBufferFrameSize);
+                if (rd < inIOBufferFrameSize) {
+                    memset(buffer + (rd * kNumChannels), 0,
+                           (inIOBufferFrameSize - rd) * kBytesPerFrame);
                 }
 
                 Float32 vol = gDriverState.volumeL;
@@ -1100,8 +1221,6 @@ static OSStatus R26_DoIOOperation(AudioServerPlugInDriverRef inDriver,
                 }
                 return kAudioHardwareNoError;
             }
-        } else {
-            shm_connect();
         }
 
         memset(buffer, 0, totalSamples * sizeof(Float32));
@@ -1110,12 +1229,11 @@ static OSStatus R26_DoIOOperation(AudioServerPlugInDriverRef inDriver,
     if (inOperationID == kAudioServerPlugInIOOperationWriteMix) {
         Float32 *buffer = (Float32 *)ioMainBuffer;
 
-        // Write output audio to shared memory (output ring buffer)
-        if (gDriverState.shmConnected && gDriverState.shm) {
-            r26_rb_write(&gDriverState.shm->output, kNumChannels,
+        R26SharedAudio *sp = atomic_load_explicit(&gDriverState.shm_ptr,
+                                                   memory_order_acquire);
+        if (sp) {
+            r26_rb_write(&sp->output, kNumChannels,
                          buffer, inIOBufferFrameSize);
-        } else {
-            shm_connect();
         }
     }
 
@@ -1185,7 +1303,11 @@ void *R26Audio_Create(CFAllocatorRef allocator, CFUUIDRef requestedTypeUUID) {
     gDriverState.sampleRate = kDefaultSampleRate;
     gDriverState.volumeL = 1.0f;
     gDriverState.volumeR = 1.0f;
-    gDriverState.shmFd = -1;
+    atomic_init(&gDriverState.shm_ptr, NULL);
+    atomic_init(&gDriverState.shm_fd, -1);
+    atomic_init(&gDriverState.shm_inode, 0);
+    atomic_init(&gDriverState.deviceAlive, false);
+    atomic_init(&gDriverState.monitorRunning, false);
 
     compute_host_ticks_per_frame();
 
