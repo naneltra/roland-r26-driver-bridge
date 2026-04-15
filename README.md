@@ -1,12 +1,25 @@
-Architecture
+## Architecture
 
-  R-26 (USB, Vendor ID 0x0582, Product ID 0x013E)
-        ↓ isochronous USB audio
-  r26d daemon (libusb)
-        ↓ POSIX shared memory ring buffer (/r26audio)
-  R26Audio.driver (CoreAudio AudioServerPlugIn)
-        ↓
-  Logic / Ableton / Reaper / any macOS app
+```mermaid
+flowchart TD
+    R26["Roland R-26<br/>(USB VID 0x0582 · PID 0x013E)"]
+    Daemon["<b>r26d daemon</b><br/>libusb — isochronous capture"]
+    SHM[("POSIX shared memory<br/><code>/r26audio</code><br/>lock-free SPSC ring buffer")]
+    Driver["<b>R26Audio.driver</b><br/>CoreAudio AudioServerPlugIn"]
+    App["Logic · Ableton · Reaper<br/>any macOS audio app"]
+
+    R26 -->|isochronous USB audio| Daemon
+    Daemon -->|writes PCM frames| SHM
+    SHM -->|reads PCM frames| Driver
+    Driver -->|virtual &quot;Roland R-26&quot; device| App
+
+    classDef hw fill:#2d3748,stroke:#4a5568,color:#fff;
+    classDef sw fill:#2b6cb0,stroke:#2c5282,color:#fff;
+    classDef shm fill:#744210,stroke:#975a16,color:#fff;
+    class R26 hw;
+    class Daemon,Driver,App sw;
+    class SHM shm;
+```
 
   Components
 
